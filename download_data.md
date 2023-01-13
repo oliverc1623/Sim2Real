@@ -14,7 +14,7 @@ Unzip the tar file with
 tar -xvf vkitti_2.0.3_rgb.tar
 ```
 
-## KITTI
+## KITTI:
 
 Refer to the [Object Tracking Evaluation page](https://www.cvlibs.net/datasets/kitti/eval_tracking.php). Call wget on the left color images. 
 
