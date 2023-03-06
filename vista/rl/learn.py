@@ -1,8 +1,9 @@
 import matplotlib.pyplot as plt
 import vista
 import os
-from NeuralNetwork import NeuralNetwork, run_driving_model, compute_driving_loss
+from NeuralNetwork import NeuralNetwork, run_driving_model, compute_driving_loss, get_model
 import torch
+from torch import nn
 from memory import Memory
 from tqdm import tqdm
 import numpy as np
@@ -64,26 +65,48 @@ def train_step(
     actions,
     discounted_rewards,
     running_loss,
+    loss_file,
     custom_fwd_fn=None,
 ):
     with torch.enable_grad():
+        # zero the parameter gradients
+        optimizer.zero_grad()
         # Forward propagate through the agent network
-        if custom_fwd_fn is not None:
-            prediction = custom_fwd_fn(observations, model)
-        else:
-            prediction = model(observations)
+        prediction = custom_fwd_fn(observations, model)
         loss = loss_function(prediction, actions, discounted_rewards)
         loss.backward()
         running_loss += loss.item()
         optimizer.step()
+        loss_file.write(str(loss.item())+"\n")
 
 
 # instantiate driving agent
-driving_model = NeuralNetwork()
+driving_model = nn.Sequential(
+            nn.Conv2d(3, 32, 5),
+            nn.SiLU(),
+            nn.Conv2d(32, 48, 5),
+            nn.SiLU(),
+            nn.Conv2d(48, 64, 3),
+            nn.SiLU(),
+            nn.Conv2d(64, 64, 3),
+            nn.SiLU(),
+            nn.Flatten(),
+            nn.Linear(302016, 128),
+            nn.SiLU(),
+            nn.Linear(128, 2)
+        )  #NeuralNetwork()
+driving_model.train()
 print(driving_model)
 
 learning_rate = 5e-4
 optimizer = torch.optim.Adam(driving_model.parameters(), lr=learning_rate)
+
+# hyperparameters
+max_curvature = 1/8. 
+max_std = 0.1 
+
+loss_file = open("loss.txt", "w")
+loss_file.write(f"loss,steps\n")
 
 memory = Memory()
 
@@ -102,16 +125,17 @@ for i_episode in range(500):
     vista_reset()
     memory.clear()
     observation = grab_and_preprocess_obs(car, camera)
+    steps = 0
     while True:
         curvature_dist = run_driving_model(observation, driving_model)
         curvature_action = curvature_dist.sample()[0, 0]
         vista_step(curvature_action)
         observation = grab_and_preprocess_obs(car, camera)
-        # observation = np.array(observation)
         reward = 1.0 if not check_crash(car) else 0.0
 
         # add to memory
         memory.add_to_memory(observation, curvature_action, reward)
+        steps += 1
 
         if reward == 0.0:
             total_reward = sum(memory.rewards)
@@ -120,16 +144,28 @@ for i_episode in range(500):
             i = np.random.choice(len(memory), batch_size, replace=False)
             observation_batch = [memory.observations[indx] for indx in i]
             observation_batch = torch.stack(observation_batch, 0)
-            train_step(
-                driving_model,
-                compute_driving_loss,
-                optimizer,
-                observations=observation_batch,
-                actions=torch.from_numpy(np.array(memory.actions)[i]),
-                discounted_rewards=discount_rewards(memory.rewards)[i],
-                running_loss=running_loss,
-                custom_fwd_fn=run_driving_model,
-            )
+
+            # zero the parameter gradients
+            optimizer.zero_grad()
+            with torch.no_grad():
+                # Forward propagate through the agent network
+                observation_batch = observation_batch.permute(0,3,1,2)
+                prediction = driving_model(observation_batch)
+                mu, logsigma = torch.split(prediction, 1, dim=1)
+                mu = max_curvature * torch.tanh(mu) # conversion
+                sigma = max_std * torch.sigmoid(logsigma) + 0.005 # conversion
+                pred_dist = torch.distributions.normal.Normal(loc=mu, scale=sigma)
+                actions = torch.from_numpy(np.array(memory.actions)[i])
+                discounted_rewards = discount_rewards(memory.rewards)[i],
+            with torch.enable_grad():
+                loss = compute_driving_loss(pred_dist, actions, discounted_rewards)                
+                loss.backward()
+                running_loss += loss.item()
+                optimizer.step()
+
             # reset the memory
             memory.clear()
             break
+    print(f"Epoch{i_episode}, running loss: {running_loss:.4f}")
+    loss_file.write(f"{str(running_loss)}, {steps}\n")
+
