@@ -274,7 +274,6 @@ def compute_driving_loss(dist, actions, rewards):
     #   loss
     neg_logprob = -1 * dist.log_prob(actions)
     loss = torch.mean(neg_logprob * rewards)
-    print(f"loss: {loss}")
     return loss
 
 
@@ -341,7 +340,7 @@ optimizer = optim.SGD(driving_model.parameters(), lr=learning_rate)
 # to track our progress
 # get current date and time
 now = datetime.datetime.now()
-filename = f"results_{now.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+filename = f"results/results_{now.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
 # open file and write rewards and losses to it
 f = open(filename, "w") 
 f.write("reward\tloss\n")
@@ -359,7 +358,7 @@ max_batch_size = 300
 max_reward = float("-inf")  # keep track of the maximum reward acheived during training
 if hasattr(tqdm, "_instances"):
     tqdm._instances.clear()  # clear if it exists
-for i_episode in range(500):
+for i_episode in range(2):
     driving_model.eval() # set to eval mode because we pass in a single image - not a batch
     running_loss = 0
     # Restart the environment
@@ -388,6 +387,7 @@ for i_episode in range(500):
             driving_model.train() # set to train as we pass in a batch
             # determine total reward and keep a record of this
             total_reward = sum(memory.rewards)
+            print(f"reward: {total_reward}")
 
             # execute training step - remember we don't know anything about how the
             #   agent is doing until it has crashed! if the training step is too large
@@ -418,10 +418,13 @@ for i_episode in range(500):
             )
             # episodic loss
             episode_loss = running_loss / batch_size
-
+            print(f"loss: {episode_loss}")
+            
             # Write reward and loss to results txt file
             f.write(f"{total_reward}\t{episode_loss}\n")
             
             # reset the memory
             memory.clear()
             break
+
+torch.save(driving_model.state_dict(), "models/basic_cnn.pth")
