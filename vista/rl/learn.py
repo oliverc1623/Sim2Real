@@ -4,10 +4,8 @@ import vista
 import os
 import torch
 from torch import nn
-from memory import Memory
 from tqdm import tqdm
 import numpy as np
-from NeuralNetwork import Model
 import torch
 import torch.nn.functional as F
 import torch.distributions as dist
@@ -15,6 +13,10 @@ import torch.optim as optim
 import time
 import datetime
 from IPython import display as ipythondisplay
+import resnet
+from rnn import RNNModel
+from torch.optim.lr_scheduler import StepLR
+
 
 # %%
 device = (
@@ -101,11 +103,11 @@ def train_step(
     loss = loss_function(prediction, actions, discounted_rewards)
     loss.backward()
 
-    nn.utils.clip_grad_norm_(model.parameters(), 2)
+    nn.utils.clip_grad_norm_(model.parameters(), 4)
     optimizer.step()
-    running_loss += loss.item()
+    # running_loss += loss.item()
     optimizer.zero_grad()
-    return running_loss
+    return loss.item()
 
 
 # %%
@@ -197,7 +199,7 @@ import torch.nn.functional as F
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout_prob=0.5):
         super(Model, self).__init__()
 
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=32, kernel_size=5, stride=2)
@@ -223,6 +225,8 @@ class Model(nn.Module):
 
         self.fc2 = nn.Linear(in_features=128, out_features=2)
 
+        self.dropout = nn.Dropout(p=dropout_prob)
+
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
@@ -232,6 +236,7 @@ class Model(nn.Module):
         x = F.relu(self.bn6(self.conv6(x)))
         x = x.reshape(-1, 256 * 1 * 1)
         x = F.relu(self.bn7(self.fc1(x)))
+        x = self.dropout(x)
         x = self.fc2(x)
 
         return x
@@ -278,64 +283,18 @@ def compute_driving_loss(dist, actions, rewards):
 
 
 # %%
-class LossHistory:
-    def __init__(self, smoothing_factor=0.0):
-        self.alpha = smoothing_factor
-        self.loss = []
-
-    def append(self, value):
-        self.loss.append(
-            self.alpha * self.loss[-1] + (1 - self.alpha) * value
-            if len(self.loss) > 0
-            else value
-        )
-
-    def get(self):
-        return self.loss
-
-
-class PeriodicPlotter:
-    def __init__(self, sec, xlabel="", ylabel="", scale=None):
-        self.xlabel = xlabel
-        self.ylabel = ylabel
-        self.sec = sec
-        self.scale = scale
-
-        self.tic = time.time()
-
-    def plot(self, data):
-        if time.time() - self.tic > self.sec:
-            plt.cla()
-
-            if self.scale is None:
-                plt.plot(data)
-            elif self.scale == "semilogx":
-                plt.semilogx(data)
-            elif self.scale == "semilogy":
-                plt.semilogy(data)
-            elif self.scale == "loglog":
-                plt.loglog(data)
-            else:
-                raise ValueError("unrecognized parameter scale {}".format(self.scale))
-
-            plt.xlabel(self.xlabel)
-            plt.ylabel(self.ylabel)
-            ipythondisplay.clear_output(wait=True)
-            ipythondisplay.display(plt.gcf())
-
-            self.tic = time.time()
-
-
-# %%
 ## Training parameters and initialization ##
 ## Re-run this cell to restart training from scratch ##
 
 # instantiate driving agent
 vista_reset()
-driving_model = Model()
+driving_model = RNNModel()
+print(driving_model)
 
-learning_rate = 0.001  # 5e-4
+learning_rate = 5e-3
 optimizer = optim.SGD(driving_model.parameters(), lr=learning_rate)
+
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
 
 # to track our progress
 # get current date and time
@@ -358,7 +317,7 @@ max_batch_size = 300
 max_reward = float("-inf")  # keep track of the maximum reward acheived during training
 if hasattr(tqdm, "_instances"):
     tqdm._instances.clear()  # clear if it exists
-for i_episode in range(2):
+for i_episode in range(1000):
     driving_model.eval() # set to eval mode because we pass in a single image - not a batch
     running_loss = 0
     # Restart the environment
@@ -418,13 +377,15 @@ for i_episode in range(2):
             )
             # episodic loss
             episode_loss = running_loss / batch_size
-            print(f"loss: {episode_loss}")
-            
+            print(f"loss: {episode_loss}\n")
+
             # Write reward and loss to results txt file
             f.write(f"{total_reward}\t{episode_loss}\n")
             
             # reset the memory
+            # scheduler.step()
             memory.clear()
             break
-
-torch.save(driving_model.state_dict(), "models/basic_cnn.pth")
+    
+    if i_episode % 100 == 0:
+        torch.save(driving_model.state_dict(), "models/rnn.pth")
