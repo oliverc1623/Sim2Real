@@ -13,9 +13,10 @@ import torch.optim as optim
 import time
 import datetime
 from IPython import display as ipythondisplay
-import resnet
-from rnn import RNNModel
+from resnet import ResNet34, ResNet18
+from rnn import MyRNN
 from torch.optim.lr_scheduler import StepLR
+import torchvision
 
 
 # %%
@@ -95,19 +96,19 @@ def train_step(
     running_loss,
     custom_fwd_fn=None,
 ):
-    # Forward propagate through the agent network
-    if custom_fwd_fn is not None:
-        prediction = custom_fwd_fn(observations)
-    else:
-        prediction = model(observations)
-    loss = loss_function(prediction, actions, discounted_rewards)
-    loss.backward()
-
-    nn.utils.clip_grad_norm_(model.parameters(), 4)
-    optimizer.step()
-    # running_loss += loss.item()
-    optimizer.zero_grad()
-    return loss.item()
+    with torch.enable_grad():
+       # Forward propagate through the agent network
+        if custom_fwd_fn is not None:
+            prediction = custom_fwd_fn(observations, model)
+        else:
+            prediction = model(observations)
+        # back propagate
+        loss = loss_function(prediction, actions, discounted_rewards)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_value_(model.parameters(), 5)
+        optimizer.step()
+    return loss.item()*observations.shape[0]
 
 
 # %%
@@ -162,7 +163,13 @@ def check_out_of_lane(car):
     distance_from_center = np.abs(car.relative_state.x)
     road_width = car.trace.road_width
     half_road_width = road_width / 2
+    # make road width narrower to penalize out of lane movement
+    # third_road_width = road_width / 4
     return distance_from_center > half_road_width
+
+
+def dist_to_lane(car):
+    pass
 
 
 def check_exceed_max_rot(car):
@@ -249,7 +256,7 @@ max_curvature = 1 / 8.0
 max_std = 0.1
 
 
-def run_driving_model(image):
+def run_driving_model(image, model):
     # Arguments:
     #   image: an input image
     # Returns:
@@ -260,7 +267,8 @@ def run_driving_model(image):
 
     image = image.permute(0, 3, 1, 2)
     # print(f"input shape: {image.shape}")
-    distribution = driving_model(image)
+    distribution = model(image)
+    # print(f"raw output distribution: {distribution}")
 
     mu, logsigma = torch.chunk(distribution, 2, dim=1)
     mu = max_curvature * torch.tanh(mu)  # conversion
@@ -277,9 +285,10 @@ def compute_driving_loss(dist, actions, rewards):
     #   rewards: the rewards the agent received in an episode
     # Returns:
     #   loss
-    neg_logprob = -1 * dist.log_prob(actions)
-    loss = torch.mean(neg_logprob * rewards)
-    return loss
+    with torch.enable_grad():
+        neg_logprob = -1 * dist.log_prob(actions)
+        loss = torch.mean(neg_logprob * rewards)
+        return loss
 
 
 # %%
@@ -288,13 +297,14 @@ def compute_driving_loss(dist, actions, rewards):
 
 # instantiate driving agent
 vista_reset()
-driving_model = RNNModel()
+driving_model = ResNet18() #RNNModel()
 print(driving_model)
 
-learning_rate = 5e-3
-optimizer = optim.SGD(driving_model.parameters(), lr=learning_rate)
-
-scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+learning_rate = 1e-4
+optimizer = optim.Adam(driving_model.parameters(), lr=learning_rate, weight_decay=1e-4)
+running_loss = 0
+datasize = 0
+# scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
 
 # to track our progress
 # get current date and time
@@ -317,9 +327,8 @@ max_batch_size = 300
 max_reward = float("-inf")  # keep track of the maximum reward acheived during training
 if hasattr(tqdm, "_instances"):
     tqdm._instances.clear()  # clear if it exists
-for i_episode in range(1000):
+for i_episode in range(500):
     driving_model.eval() # set to eval mode because we pass in a single image - not a batch
-    running_loss = 0
     # Restart the environment
     vista_reset()
     memory.clear()
@@ -328,7 +337,10 @@ for i_episode in range(1000):
     print(f"Episode: {i_episode}")
 
     while True:
-        curvature_dist = run_driving_model(observation)
+        curvature_dist = run_driving_model(observation, driving_model)
+        # print(f"model output distribution: {curvature_dist}")
+        # print(f"output mean: {curvature_dist.loc}")
+        # print(f"output std: {curvature_dist.scale}")
         curvature_action = curvature_dist.sample()[0, 0]
 
         # Step the simulated car with the same action
@@ -354,10 +366,23 @@ for i_episode in range(1000):
             batch_size = min(len(memory), max_batch_size)
             i = torch.randint(len(memory), (batch_size,), dtype=torch.long)
 
+            # print(len(memory.observations))
+            # print(f"shape of a single obs: {memory.observations[0].shape}")
             batch_observations = torch.stack(memory.observations, dim=0)
             batch_observations = torch.index_select(batch_observations, dim=0, index=i)
+            # print(f"batch_obs shape: {batch_observations.shape}")
+
+            # print(f"output for a single image from batch 1: {run_driving_model(memory.observations[0], driving_model)}")
+            # print(f"output for a single image from batch 2: {run_driving_model(memory.observations[1], driving_model)}")
+
+            # grid_img = torchvision.utils.make_grid(batch_observations.permute(0, 3, 1, 2), nrow=5)
+            # print(f"grid iamge shape: {grid_img.shape}")
+            # plt.imshow(grid_img.permute(1, 2, 0))
+            # plt.show()
 
             batch_actions = torch.stack(memory.actions)
+            # print(f"batch actions: {batch_actions}")
+            # print(f"batch actions shape: {batch_actions.shape}")
             batch_actions = torch.index_select(
                 batch_actions, dim=0, index=i
             ) 
@@ -365,7 +390,7 @@ for i_episode in range(1000):
             batch_rewards = torch.tensor(memory.rewards)
             batch_rewards = discount_rewards(batch_rewards)[i]
 
-            running_loss = train_step(
+            episode_loss = train_step(
                 driving_model,
                 compute_driving_loss,
                 optimizer,
@@ -375,15 +400,18 @@ for i_episode in range(1000):
                 running_loss=running_loss,
                 custom_fwd_fn=run_driving_model,
             )
+            running_loss += episode_loss
+            datasize += batch_size
             # episodic loss
-            episode_loss = running_loss / batch_size
+            episode_loss = running_loss / datasize
+            # running_loss += episode_loss
             print(f"loss: {episode_loss}\n")
 
             # Write reward and loss to results txt file
             f.write(f"{total_reward}\t{episode_loss}\n")
             
             # reset the memory
-            # scheduler.step()
+            # scheduler.step()ç
             memory.clear()
             break
     
