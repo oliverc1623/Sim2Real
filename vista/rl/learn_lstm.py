@@ -17,11 +17,12 @@ from torch.optim.lr_scheduler import StepLR
 import torchvision
 import torch.nn.functional as F
 import importlib
+import rnn
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using {device} device")
 
-models = {"ResNet18": resnet.ResNet18, "ResNet34": resnet.ResNet34, "rnn": rnn.MyRNN}
+models = {"ResNet18": resnet.ResNet18, "ResNet34": resnet.ResNet34, "rnn": rnn.MyRNN, "LSTM": rnn.LSTMLaneFollower}
 
 ### Agent Memory ###
 class Memory:
@@ -155,6 +156,7 @@ class Learner:
 
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
+        optimizer.zero_grad()
         with torch.enable_grad():
             # Forward propagate through the agent network
             prediction = self._run_driving_model_(observations)
@@ -162,11 +164,10 @@ class Learner:
             loss = self._compute_driving_loss_(
                 dist=prediction, actions=actions, rewards=discounted_rewards
             )
-            optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_value_(self.driving_model.parameters(), 5)
             optimizer.step()
-        return loss.item() * observations.shape[0]
+        return loss.item()
 
     ## The self-driving learning algorithm ##
     def _run_driving_model_(self, image):
@@ -174,10 +175,9 @@ class Learner:
         if single_image_input:
             image = image.unsqueeze(0)
 
-        image = image.permute(0, 3, 1, 2)
+        image = image.permute(0, 3, 1, 2).unsqueeze(0)
         # print(f"input shape: {image.shape}")
         distribution = self.driving_model(image)
-        # print(f"raw output distribution: {distribution}")
 
         mu, logsigma = torch.chunk(distribution, 2, dim=1)
         mu = self.max_curvature * torch.tanh(mu)  # conversion
@@ -197,7 +197,7 @@ class Learner:
 
         ## Training parameters and initialization ##
         ## Re-run this cell to restart training from scratch ##
-        optimizer = optim.Adam(
+        optimizer = optim.SGD(
             self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4
         )
         running_loss = 0
@@ -238,19 +238,13 @@ class Learner:
                     # execute training step - remember we don't know anything about how the
                     #   agent is doing until it has crashed! if the training step is too large
                     #   we need to sample a mini-batch for this step.
-                    batch_size = min(len(memory), max_batch_size)
-                    i = torch.randperm(len(memory))[:batch_size]
 
                     batch_observations = torch.stack(memory.observations, dim=0)
-                    batch_observations = torch.index_select(
-                        batch_observations, dim=0, index=i
-                    )
 
                     batch_actions = torch.stack(memory.actions)
-                    batch_actions = torch.index_select(batch_actions, dim=0, index=i)
 
                     batch_rewards = torch.tensor(memory.rewards)
-                    batch_rewards = self._discount_rewards_(batch_rewards)[i]
+                    batch_rewards = self._discount_rewards_(batch_rewards)
 
                     episode_loss = self._train_step_(
                         optimizer,
@@ -259,7 +253,7 @@ class Learner:
                         discounted_rewards=batch_rewards
                     )
                     running_loss += episode_loss
-                    datasize += batch_size
+                    datasize += len(memory.observations)
                     # episodic loss
                     episode_loss = running_loss / datasize
                     # running_loss += episode_loss

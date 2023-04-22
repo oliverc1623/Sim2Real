@@ -1,12 +1,14 @@
 import argparse
-from learn import Memory, Learner
+# from learn import Memory, Learner
+# from learn_lstm import Learner
+from learn import Learner
 import matplotlib.pyplot as plt
 
 def main(args):
     print(args.neuralnetwork)
     learner = Learner(args.neuralnetwork, args.learning_rate, args.episodes)
     learner.learn()
-    learner.save()
+    # learner.save()
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser(description="VISTA Deep Reinforcement Learner")
