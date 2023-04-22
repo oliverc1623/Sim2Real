@@ -209,6 +209,14 @@ class Learner:
         max_batch_size = 300
         max_reward = float("-inf")  # keep track of the maximum reward acheived during training
 
+        # define temperature annealing schedule
+        initial_temperature = 1.0
+        annealing_factor = 0.95
+        anneal_step = 0.0
+        # Define a threshold for big reward gain
+        reward_gain_threshold = 100
+        best_reward = 0
+
         for i_episode in range(self.episodes):
             self.driving_model.eval()  # set to eval mode because we pass in a single image - not a batch
             # Restart the environment
@@ -219,8 +227,12 @@ class Learner:
             print(f"Episode: {i_episode}")
 
             while True:
-                curvature_dist = self._run_driving_model_(observation)
-                curvature_action = curvature_dist.sample()[0, 0]
+                curvature_dist = self._run_driving_model_(observation)                
+                # compute current temperature
+                temperature = initial_temperature * (annealing_factor**anneal_step)
+                # softened distribution
+                softened_dist = dist.Normal(curvature_dist.loc, curvature_dist.scale*temperature)
+                curvature_action = softened_dist.sample()[0, 0]
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
                 observation = self._grab_and_preprocess_obs_()
@@ -234,6 +246,10 @@ class Learner:
                     # determine total reward and keep a record of this
                     total_reward = sum(memory.rewards)
                     print(f"reward: {total_reward}")
+
+                    if total_reward > best_reward:
+                        anneal_step = anneal_step + (total_reward-best_reward)
+                        best_reward = total_reward
 
                     # execute training step - remember we don't know anything about how the
                     #   agent is doing until it has crashed! if the training step is too large
