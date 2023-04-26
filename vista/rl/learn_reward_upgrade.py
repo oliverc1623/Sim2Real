@@ -17,12 +17,16 @@ from torch.optim.lr_scheduler import StepLR
 import torchvision
 import torch.nn.functional as F
 import importlib
-import rnn
+import math
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using {device} device")
 
-models = {"ResNet18": resnet.ResNet18, "ResNet34": resnet.ResNet34, "rnn": rnn.MyRNN, "LSTM": rnn.LSTMLaneFollower}
+models = {"ResNet18": resnet.ResNet18, 
+          "ResNet34": resnet.ResNet34, 
+          "ResNet50": resnet.ResNet50, 
+          "ResNet101": resnet.ResNet101,
+          "rnn": rnn.MyRNN}
 
 ### Agent Memory ###
 class Memory:
@@ -34,12 +38,14 @@ class Memory:
         self.observations = []
         self.actions = []
         self.rewards = []
+        self.deviation = []
 
     # Add observations, actions, rewards to memory
-    def add_to_memory(self, new_observation, new_action, new_reward):
+    def add_to_memory(self, new_observation, new_action, new_reward, new_deviation):
         self.observations.append(new_observation)
         self.actions.append(new_action)
         self.rewards.append(new_reward)
+        self.deviation.append(new_deviation)
 
     def __len__(self):
         return len(self.actions)
@@ -82,7 +88,7 @@ class Learner:
         self.timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
         filename = f"results/{model_name}_results_{self.timestamp}.txt"
         self.f = open(filename, "w") 
-        self.f.write("reward\tloss\n")
+        self.f.write("reward\trunning_loss\tepisode_loss\tstep\n")
         self.model_name = model_name
 
         # hyperparameters
@@ -108,6 +114,7 @@ class Learner:
     def _normalize_(self, x):
         x -= torch.mean(x)
         x /= torch.std(x)
+        # x = torch.clamp(x,min=0)
         return x
 
     # Compute normalized, discounted, cumulative rewards (i.e., return)
@@ -118,7 +125,6 @@ class Learner:
             # update the total discounted reward
             R = R * gamma + rewards[t]
             discounted_rewards[t] = R
-
         return self._normalize_(discounted_rewards)
 
     # Check if in terminal state
@@ -137,6 +143,11 @@ class Learner:
         return (
             self._check_out_of_lane_() or self._check_exceed_max_rot_() or self.car.done
         )
+    
+    ## Out of lane punishment
+    def _out_of_lane_punishment(self):
+        distance_from_center = np.abs(self.car.relative_state.x)
+        return -distance_from_center
 
     ## Data preprocessing functions ##
     def _preprocess_(self, full_obs):
@@ -169,15 +180,22 @@ class Learner:
             optimizer.step()
         return loss.item()
 
+    def _compute_driving_loss_(self, dist, actions, rewards):
+        with torch.enable_grad():
+            neg_logprob = -1 * dist.log_prob(actions)
+            loss = torch.mean(neg_logprob * rewards)
+            return loss
+
     ## The self-driving learning algorithm ##
     def _run_driving_model_(self, image):
         single_image_input = len(image.shape) == 3  # missing 4th batch dimension
         if single_image_input:
             image = image.unsqueeze(0)
 
-        image = image.permute(0, 3, 1, 2).unsqueeze(0)
+        image = image.permute(0, 3, 1, 2)
         # print(f"input shape: {image.shape}")
         distribution = self.driving_model(image)
+        # print(f"raw output distribution: {distribution}")
 
         mu, logsigma = torch.chunk(distribution, 2, dim=1)
         mu = self.max_curvature * torch.tanh(mu)  # conversion
@@ -186,20 +204,12 @@ class Learner:
         pred_dist = dist.Normal(mu, sigma)
         return pred_dist
 
-    def _compute_driving_loss_(self, dist, actions, rewards):
-        with torch.enable_grad():
-            neg_logprob = -1 * dist.log_prob(actions)
-            loss = torch.mean(neg_logprob * rewards)
-            return loss
-
     def learn(self):
         self._vista_reset_()
 
         ## Training parameters and initialization ##
         ## Re-run this cell to restart training from scratch ##
-        optimizer = optim.SGD(
-            self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4
-        )
+        optimizer = optim.Adam(self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
         running_loss = 0
         datasize = 0
         # instantiate Memory buffer
@@ -207,7 +217,10 @@ class Learner:
 
         ## Driving training! Main training block. ##
         max_batch_size = 300
-        max_reward = float("-inf")  # keep track of the maximum reward acheived during training
+        max_reward = float("-inf")  # keep track of the maximum reward achieved during training
+
+        # Define the lane center deviation penalty weight
+        lane_center_penalty_weight = 0.01
 
         for i_episode in range(self.episodes):
             self.driving_model.eval()  # set to eval mode because we pass in a single image - not a batch
@@ -219,28 +232,23 @@ class Learner:
             print(f"Episode: {i_episode}")
 
             while True:
-                curvature_dist = self._run_driving_model_(observation)
-                curvature_action = curvature_dist.sample()[0, 0]
+                curvature_dist = self._run_driving_model_(observation)      
+                softened_dist = dist.Normal(curvature_dist.loc, curvature_dist.scale/2)          
+                curvature_action = softened_dist.sample()[0,0].item()
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
                 observation = self._grab_and_preprocess_obs_()
-                print(observation)
-                plt.imshow(observation)
-                plt.show()
-                reward = 1.0 if not self._check_crash_() else 0.0
+                reward = (1.0) if not self._check_crash_() else 0.0
+                deviation = np.abs(self.car.relative_state.x) # calculate distance from lane
                 # add to memory
-                memory.add_to_memory(observation, curvature_action, reward)
+                memory.add_to_memory(observation, curvature_action, reward, deviation)
                 steps += 1
-                # is the episode over? did you crash or do so well that you're done?
+
                 if reward == 0.0:
                     self.driving_model.train()  # set to train as we pass in a batch
-                    # determine total reward and keep a record of this
-                    total_reward = sum(memory.rewards)
-                    print(f"reward: {total_reward}")
+                    # total_reward = sum(memory.rewards)
+                    print(f"steps: {steps-1}")
 
-                    # execute training step - remember we don't know anything about how the
-                    #   agent is doing until it has crashed! if the training step is too large
-                    #   we need to sample a mini-batch for this step.
                     batch_size = min(len(memory), max_batch_size)
                     i = torch.randperm(len(memory))[:batch_size]
 
@@ -249,11 +257,19 @@ class Learner:
                         batch_observations, dim=0, index=i
                     )
 
-                    batch_actions = torch.stack(memory.actions)
+                    batch_actions = torch.tensor(memory.actions)
                     batch_actions = torch.index_select(batch_actions, dim=0, index=i)
 
+                    batch_deviations = torch.tensor(memory.deviation)
                     batch_rewards = torch.tensor(memory.rewards)
-                    batch_rewards = self._discount_rewards_(batch_rewards)
+                    penalized_rewards = batch_rewards - batch_deviations
+                    # print(penalized_rewards)
+                    total_reward = sum(penalized_rewards)
+                    # print(f"total reward: {total_reward}")
+                    batch_rewards = self._discount_rewards_(penalized_rewards)
+                    # print(batch_rewards)
+                    batch_rewards = torch.index_select(batch_rewards, dim=0, index=i)
+                    
 
                     episode_loss = self._train_step_(
                         optimizer,
@@ -262,30 +278,15 @@ class Learner:
                         discounted_rewards=batch_rewards
                     )
                     running_loss += episode_loss
-                    datasize += len(memory.observations)
+                    print(f"episode loss: {episode_loss}\n")
                     # episodic loss
-                    episode_loss = running_loss / datasize
-                    # running_loss += episode_loss
-                    print(f"loss: {running_loss}\n")
+                    print(f"running loss: {running_loss}\n")
                     
                     # Write reward and loss to results txt file
-                    self.f.write(f"{total_reward}\t{running_loss}\n")
+                    self.f.write(f"{total_reward}\t{running_loss}\t{episode_loss}\t{steps}\n")
                     
                     # reset the memory
                     memory.clear()
-
-                    # Check gradients norms
-                    total_norm = 0
-                    for p in self.driving_model.parameters():
-                        param_norm = p.grad.data.norm(2) # calculate the L2 norm of gradients
-                        total_norm += param_norm.item() ** 2 # accumulate the squared norm
-                    total_norm = total_norm ** 0.5 # take the square root to get the total norm
-                    print(f"Total gradient norm: {total_norm}")
-
-                    # Iterate through model's parameters
-                    for name, param in self.driving_model.named_parameters():
-                        if torch.isnan(param).any() or torch.isinf(param).any():
-                            print(f'NaN or Inf found in parameter {name}')
                     break
     
     def save(self):

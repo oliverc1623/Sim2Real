@@ -13,15 +13,20 @@ import time
 import datetime
 import resnet
 import rnn
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import lr_scheduler
 import torchvision
 import torch.nn.functional as F
 import importlib
+import torchvision.transforms as transforms
+from PIL import Image
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using {device} device")
 
-models = {"ResNet18": resnet.ResNet18, "ResNet34": resnet.ResNet34, "rnn": rnn.MyRNN}
+models = {"ResNet18": resnet.ResNet18, 
+          "ResNet34": resnet.ResNet34, 
+          "ResNet50": resnet.ResNet50, 
+          "rnn": rnn.MyRNN}
 
 ### Agent Memory ###
 class Memory:
@@ -89,6 +94,7 @@ class Learner:
         self.max_curvature = max_curvature
         self.max_std = max_std
         self.episodes = episodes
+        
 
     def _vista_reset_(self):
         self.world.reset()
@@ -156,16 +162,17 @@ class Learner:
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
         with torch.enable_grad():
+            optimizer.zero_grad()
             # Forward propagate through the agent network
             prediction = self._run_driving_model_(observations)
             # back propagate
             loss = self._compute_driving_loss_(
                 dist=prediction, actions=actions, rewards=discounted_rewards
             )
-            optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_value_(self.driving_model.parameters(), 5)
             optimizer.step()
+            
         return loss.item() * observations.shape[0]
 
     ## The self-driving learning algorithm ##
@@ -200,6 +207,9 @@ class Learner:
         optimizer = optim.Adam(
             self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4
         )
+        # Define a learning rate scheduler
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+
         running_loss = 0
         datasize = 0
         # instantiate Memory buffer
@@ -208,14 +218,6 @@ class Learner:
         ## Driving training! Main training block. ##
         max_batch_size = 300
         max_reward = float("-inf")  # keep track of the maximum reward acheived during training
-
-        # define temperature annealing schedule
-        initial_temperature = 1.0
-        annealing_factor = 0.95
-        anneal_step = 0.0
-        # Define a threshold for big reward gain
-        reward_gain_threshold = 100
-        best_reward = 0
 
         for i_episode in range(self.episodes):
             self.driving_model.eval()  # set to eval mode because we pass in a single image - not a batch
@@ -227,12 +229,8 @@ class Learner:
             print(f"Episode: {i_episode}")
 
             while True:
-                curvature_dist = self._run_driving_model_(observation)                
-                # compute current temperature
-                temperature = initial_temperature * (annealing_factor**anneal_step)
-                # softened distribution
-                softened_dist = dist.Normal(curvature_dist.loc, curvature_dist.scale*temperature)
-                curvature_action = softened_dist.sample()[0, 0]
+                curvature_dist = self._run_driving_model_(observation)
+                curvature_action = curvature_dist.sample()[0, 0]
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
                 observation = self._grab_and_preprocess_obs_()
@@ -246,10 +244,6 @@ class Learner:
                     # determine total reward and keep a record of this
                     total_reward = sum(memory.rewards)
                     print(f"reward: {total_reward}")
-
-                    if total_reward > best_reward:
-                        anneal_step = anneal_step + (total_reward-best_reward)
-                        best_reward = total_reward
 
                     # execute training step - remember we don't know anything about how the
                     #   agent is doing until it has crashed! if the training step is too large
@@ -286,6 +280,9 @@ class Learner:
                     
                     # reset the memory
                     memory.clear()
+
+                    # step scheduler
+                    scheduler.step()
                     break
     
     def save(self):

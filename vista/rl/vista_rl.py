@@ -1,7 +1,8 @@
 import argparse
 # from learn import Memory, Learner
-# from learn_lstm import Learner
-from learn import Learner
+from learn_lstm import Learner
+# from learn import Learner
+# from learn_reward_upgrade import Learner
 import matplotlib.pyplot as plt
 
 def main(args):
