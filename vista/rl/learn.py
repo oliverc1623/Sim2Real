@@ -13,7 +13,7 @@ import time
 import datetime
 import resnet
 import rnn
-from torch.optim.lr_scheduler import lr_scheduler
+# from torch.optim.lr_scheduler import lr_scheduler
 import torchvision
 import torch.nn.functional as F
 import importlib
@@ -148,16 +148,30 @@ class Learner:
         # Extract ROI
         i1, j1, i2, j2 = self.camera.camera_param.get_roi()
         obs = full_obs[i1:i2, j1:j2]
-
-        # Rescale to [0, 1]
-        obs = obs / 255.0
         return obs
+    
+    def _augment_image(self, cropped_obs):
+        # Initialize car_lane_image as an RGB image with random pixel values in the range of 0-255
+        car_lane_image = cropped_obs
+        # Convert the car_lane_image to a PIL Image object
+        car_lane_image_pil = Image.fromarray(car_lane_image)
+        # Define the image augmentation transforms
+        augmentation_transforms = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),  # Randomly flip horizontally with 50% probability
+            transforms.RandomVerticalFlip(p=0.5),    # Randomly flip vertically with 50% probability
+            transforms.RandomRotation(15),           # Randomly rotate image by up to 15 degrees
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),  # Randomly adjust brightness, contrast, saturation, and hue
+            transforms.ToTensor()  # Convert image to tensor
+        ])
+        # Apply the image augmentation transforms to the car lane image
+        augmented_image = augmentation_transforms(car_lane_image_pil)
+        return augmented_image
 
     def _grab_and_preprocess_obs_(self):
         full_obs = self.car.observations[self.camera.name]
-        obs = self._preprocess_(full_obs)
-        obs = torch.from_numpy(obs).to(torch.float32)
-        return obs
+        cropped_obs = self._preprocess_(full_obs)
+        augmented_obs = self._augment_image(cropped_obs)
+        return augmented_obs.permute(1,2,0)
 
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
@@ -208,7 +222,7 @@ class Learner:
             self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4
         )
         # Define a learning rate scheduler
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        # scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
         running_loss = 0
         datasize = 0
@@ -280,9 +294,6 @@ class Learner:
                     
                     # reset the memory
                     memory.clear()
-
-                    # step scheduler
-                    scheduler.step()
                     break
     
     def save(self):
