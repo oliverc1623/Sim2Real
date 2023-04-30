@@ -1,9 +1,6 @@
 import torch
 import torch.nn as nn
-
-
-import torch
-import torch.nn as nn
+import ConvLSTM as convLSTM
 
 class MyRNN(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers):
@@ -26,3 +23,26 @@ class MyRNN(nn.Module):
         std = self.fc_std(out[:, -1, :])
 
         return mean, std
+
+
+class LSTMLaneFollower(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.convlstm = convLSTM.ConvLSTM(3, 1, (3,3), 6, True, True, False) 
+        self.flat = nn.Flatten()
+        self.lin1 = nn.Linear(1*30*32, 512)
+        self.relu = nn.ReLU()
+        self.lin2 = nn.Linear(512, 2)
+
+    def forward(self, x):
+        """
+        Does a forward pass of the given data through the layers of the neural network.
+        
+        :param img: (tensor) tensor of rgb values that represent an image
+        """
+        _, lstm_output = self.convlstm(x)
+        x = self.flat(lstm_output[0][0])
+        x = self.lin1(x)
+        x = self.relu(x)
+        x = self.lin2(x)
+        return x
