@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import importlib
 import torchvision.transforms as transforms
 from PIL import Image
+import cv2
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using {device} device")
@@ -26,6 +27,7 @@ print(f"Using {device} device")
 models = {"ResNet18": resnet.ResNet18, 
           "ResNet34": resnet.ResNet34, 
           "ResNet50": resnet.ResNet50, 
+          "ResNet101": resnet.ResNet101,
           "rnn": rnn.MyRNN}
 
 ### Agent Memory ###
@@ -52,7 +54,7 @@ class Memory:
 ### Learner Class ###
 class Learner:
     def __init__(
-        self, model_name, learning_rate, episodes, max_curvature=1 / 8.0, max_std=0.1
+        self, model_name, learning_rate, episodes, clip, max_curvature=1 / 8.0, max_std=0.1
     ) -> None:
         # Set up VISTA simulator
         trace_root = "../trace"
@@ -73,7 +75,7 @@ class Learner:
                 "lookahead_road": True,
             }
         )
-        self.camera = self.car.spawn_camera(config={"size": (200, 320)})
+        self.camera = self.car.spawn_camera(config={"size": (200*2, 320*2)})
         self.display = vista.Display(
             self.world, display_config={"gui_scale": 2, "vis_full_frame": False}
         )
@@ -86,7 +88,7 @@ class Learner:
         self.timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
         filename = f"results/{model_name}_results_{self.timestamp}.txt"
         self.f = open(filename, "w") 
-        self.f.write("reward\tloss\n")
+        self.f.write("reward\tloss\tsteps\n")
         self.model_name = model_name
 
         # hyperparameters
@@ -94,6 +96,7 @@ class Learner:
         self.max_curvature = max_curvature
         self.max_std = max_std
         self.episodes = episodes
+        self.clip = clip
         
 
     def _vista_reset_(self):
@@ -166,12 +169,25 @@ class Learner:
         # Apply the image augmentation transforms to the car lane image
         augmented_image = augmentation_transforms(car_lane_image_pil)
         return augmented_image
+    
 
-    def _grab_and_preprocess_obs_(self):
+    def _resize_image(self, img):
+        resized_img = cv2.resize(img, (32, 30))
+        return resized_img
+
+    def _grab_and_preprocess_obs_(self, resize=True, augment=True):
         full_obs = self.car.observations[self.camera.name]
         cropped_obs = self._preprocess_(full_obs)
-        augmented_obs = self._augment_image(cropped_obs)
-        return augmented_obs.permute(1,2,0)
+        if augment:
+            augmented_obs = self._augment_image(cropped_obs)
+            return augmented_obs.permute(1,2,0)
+        elif resize:
+            resized_obs = self._resize_image(cropped_obs)
+            resized_obs = resized_obs / 255.0
+            return torch.from_numpy(resized_obs).to(torch.float32)
+        else:
+            cropped_obs = cropped_obs / 255.0
+            return torch.from_numpy(cropped_obs).to(torch.float32)
 
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
@@ -184,7 +200,7 @@ class Learner:
                 dist=prediction, actions=actions, rewards=discounted_rewards
             )
             loss.backward()
-            nn.utils.clip_grad_value_(self.driving_model.parameters(), 5)
+            nn.utils.clip_grad_value_(self.driving_model.parameters(), self.clip)
             optimizer.step()
             
         return loss.item() * observations.shape[0]
@@ -210,7 +226,7 @@ class Learner:
     def _compute_driving_loss_(self, dist, actions, rewards):
         with torch.enable_grad():
             neg_logprob = -1 * dist.log_prob(actions)
-            loss = torch.mean(neg_logprob * rewards)
+            loss = (neg_logprob * rewards).mean()
             return loss
 
     def learn(self):
@@ -218,9 +234,7 @@ class Learner:
 
         ## Training parameters and initialization ##
         ## Re-run this cell to restart training from scratch ##
-        optimizer = optim.Adam(
-            self.driving_model.parameters(), lr=self.learning_rate, weight_decay=1e-4
-        )
+        optimizer = optim.Adam(self.driving_model.parameters(), lr=self.learning_rate)
         # Define a learning rate scheduler
         # scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
@@ -238,8 +252,10 @@ class Learner:
             # Restart the environment
             self._vista_reset_()
             memory.clear()
-            observation = self._grab_and_preprocess_obs_()
+            observation = self._grab_and_preprocess_obs_(resize=True, augment=False)     
+            # print(f"obs shape: {observation.shape}")       
             steps = 0
+            # plt.imsave(f"frames/{self.model_name}_train_{i_episode}_{steps}_{self.timestamp}.png", observation.numpy())
             print(f"Episode: {i_episode}")
 
             while True:
@@ -247,11 +263,15 @@ class Learner:
                 curvature_action = curvature_dist.sample()[0, 0]
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
-                observation = self._grab_and_preprocess_obs_()
+                observation = self._grab_and_preprocess_obs_(resize=True, augment=False)
+
+                # aug_observation = self._grab_and_preprocess_obs_(augment=False)
                 reward = 1.0 if not self._check_crash_() else 0.0
                 # add to memory
+                # memory.add_to_memory(observation, curvature_action, reward)
                 memory.add_to_memory(observation, curvature_action, reward)
                 steps += 1
+                # plt.imsave(f"frames/{self.model_name}_train_{i_episode}_{steps}_{self.timestamp}.png", aug_observation.numpy())
                 # is the episode over? did you crash or do so well that you're done?
                 if reward == 0.0:
                     self.driving_model.train()  # set to train as we pass in a batch
@@ -290,7 +310,7 @@ class Learner:
                     print(f"loss: {running_loss}\n")
                     
                     # Write reward and loss to results txt file
-                    self.f.write(f"{total_reward}\t{running_loss}\n")
+                    self.f.write(f"{total_reward}\t{running_loss}\t{steps}\n")
                     
                     # reset the memory
                     memory.clear()
