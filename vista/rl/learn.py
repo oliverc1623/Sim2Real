@@ -20,6 +20,7 @@ import importlib
 import torchvision.transforms as transforms
 from PIL import Image
 import cv2
+import mycnn
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using {device} device")
@@ -28,7 +29,9 @@ models = {"ResNet18": resnet.ResNet18,
           "ResNet34": resnet.ResNet34, 
           "ResNet50": resnet.ResNet50, 
           "ResNet101": resnet.ResNet101,
-          "rnn": rnn.MyRNN}
+          "rnn": rnn.MyRNN,
+          "MyCNN": mycnn.MyCNN,
+          "LSTM": rnn.LSTMLaneFollower}
 
 ### Agent Memory ###
 class Memory:
@@ -79,7 +82,7 @@ class Learner:
         self.display = vista.Display(
             self.world, display_config={"gui_scale": 2, "vis_full_frame": False}
         )
-
+        self.model_name = model_name
         self.driving_model = models[model_name]()
         print(self.driving_model)
 
@@ -210,8 +213,10 @@ class Learner:
         single_image_input = len(image.shape) == 3  # missing 4th batch dimension
         if single_image_input:
             image = image.unsqueeze(0)
-
+                
         image = image.permute(0, 3, 1, 2)
+        if self.model_name == "LSTM" or self.model_name == "resnet":
+            image = image.unsqueeze(0)
         # print(f"input shape: {image.shape}")
         distribution = self.driving_model(image)
         # print(f"raw output distribution: {distribution}")
@@ -314,6 +319,15 @@ class Learner:
                     
                     # reset the memory
                     memory.clear()
+
+                    # Check gradients norms
+                    total_norm = 0
+                    for p in self.driving_model.parameters():
+                        param_norm = p.grad.data.norm(2) # calculate the L2 norm of gradients
+                        total_norm += param_norm.item() ** 2 # accumulate the squared norm
+                    total_norm = total_norm ** 0.5 # take the square root to get the total norm
+                    print(f"Total gradient norm: {total_norm}")
+
                     break
     
     def save(self):
