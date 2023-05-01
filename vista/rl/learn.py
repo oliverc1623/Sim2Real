@@ -84,7 +84,7 @@ class Learner:
             self.world, display_config={"gui_scale": 2, "vis_full_frame": False}
         )
         self.model_name = model_name
-        self.driving_model = models[model_name]()
+        self.driving_model = models[model_name]().to(device)
         # print(self.driving_model)
 
         # open and write to file to track progress
@@ -185,25 +185,23 @@ class Learner:
         resized_obs = self._resize_image(cropped_obs)
         if augment:
             augmented_obs = self._augment_image(resized_obs)
-            return augmented_obs.permute(1,2,0)
+            return augmented_obs.permute(1,2,0).to(device)
         else:
             resized_obs_torch = resized_obs / 255.0
-            return resized_obs, torch.from_numpy(resized_obs_torch).to(torch.float32)
+            return resized_obs, torch.from_numpy(resized_obs_torch).to(torch.float32).to(device)
 
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
-        with torch.enable_grad():
-            optimizer.zero_grad()
-            # Forward propagate through the agent network
-            prediction = self._run_driving_model_(observations)
-            # back propagate
-            loss = self._compute_driving_loss_(
-                dist=prediction, actions=actions, rewards=discounted_rewards
-            )
-            loss.backward()
-            nn.utils.clip_grad_value_(self.driving_model.parameters(), self.clip)
-            optimizer.step()
-            
+        optimizer.zero_grad()
+        # Forward propagate through the agent network
+        prediction = self._run_driving_model_(observations)
+        # back propagate
+        loss = self._compute_driving_loss_(
+            dist=prediction, actions=actions, rewards=discounted_rewards
+        )
+        loss.backward()
+        nn.utils.clip_grad_value_(self.driving_model.parameters(), self.clip)
+        optimizer.step()
         return loss.item() * observations.shape[0]
 
     ## The self-driving learning algorithm ##
@@ -215,7 +213,7 @@ class Learner:
         image = image.permute(0, 3, 1, 2)
         if self.model_name == "LSTM" or self.model_name == "resnet":
             image = image.unsqueeze(0)
-        # print(f"input shape: {image.shape}")
+        # print(f"input shape: {image.is_mps}")
         distribution = self.driving_model(image)
         # print(f"raw output distribution: {distribution}")
 
@@ -223,13 +221,14 @@ class Learner:
         mu = self.max_curvature * torch.tanh(mu)  # conversion
         sigma = self.max_std * torch.sigmoid(logsigma) + 0.005  # conversion
 
-        pred_dist = dist.Normal(mu, sigma)
+        pred_dist = dist.Normal(mu.to(device), sigma.to(device))
         return pred_dist
 
     def _compute_driving_loss_(self, dist, actions, rewards):
         with torch.enable_grad():
             neg_logprob = -1 * dist.log_prob(actions)
             loss = (neg_logprob * rewards).mean()
+            loss = loss.clone().detach().requires_grad_(True)
             return loss
 
     def learn(self):
@@ -263,12 +262,13 @@ class Learner:
 
             while True:
                 curvature_dist = self._run_driving_model_(observation)
-                curvature_action = curvature_dist.sample()[0, 0]
+                curvature_action = curvature_dist.sample()[0, 0].cpu()
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
                 np_obs, observation = self._grab_and_preprocess_obs_(augment=False)
                 aug_observation = self._augment_image(np_obs).permute(1,2,0) # self._grab_and_preprocess_obs_(augment=True)
                 reward = 1.0 if not self._check_crash_() else 0.0
+                # reward = torch.tensor(reward).to(device)
                 # add to memory
                 memory.add_to_memory(aug_observation, curvature_action, reward)
                 steps += 1
@@ -284,17 +284,17 @@ class Learner:
                     #   agent is doing until it has crashed! if the training step is too large
                     #   we need to sample a mini-batch for this step.
                     batch_size = min(len(memory), max_batch_size)
-                    i = torch.randperm(len(memory))[:batch_size]
+                    i = torch.randperm(len(memory))[:batch_size].to(device)
 
-                    batch_observations = torch.stack(memory.observations, dim=0)
+                    batch_observations = torch.stack(memory.observations, dim=0).to(device)
                     batch_observations = torch.index_select(
                         batch_observations, dim=0, index=i
                     )
 
-                    batch_actions = torch.stack(memory.actions)
+                    batch_actions = torch.stack(memory.actions).to(device)            
                     batch_actions = torch.index_select(batch_actions, dim=0, index=i)
 
-                    batch_rewards = torch.tensor(memory.rewards)
+                    batch_rewards = torch.tensor(memory.rewards).to(device)
                     batch_rewards = self._discount_rewards_(batch_rewards)[i]
 
                     episode_loss = self._train_step_(
@@ -317,12 +317,12 @@ class Learner:
                     memory.clear()
 
                     # Check gradients norms
-                    total_norm = 0
-                    for p in self.driving_model.parameters():
-                        param_norm = p.grad.data.norm(2) # calculate the L2 norm of gradients
-                        total_norm += param_norm.item() ** 2 # accumulate the squared norm
-                    total_norm = total_norm ** 0.5 # take the square root to get the total norm
-                    print(f"Total gradient norm: {total_norm}")
+                    # total_norm = 0
+                    # for p in self.driving_model.parameters():
+                    #     param_norm = p.grad.data.norm(2) # calculate the L2 norm of gradients
+                    #     total_norm += param_norm.item() ** 2 # accumulate the squared norm
+                    # total_norm = total_norm ** 0.5 # take the square root to get the total norm
+                    # print(f"Total gradient norm: {total_norm}")
 
                     break
     
