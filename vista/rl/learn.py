@@ -23,6 +23,7 @@ import cv2
 import mycnn
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device(device)
 print(f"Using {device} device")
 
 models = {"ResNet18": resnet.ResNet18, 
@@ -30,7 +31,7 @@ models = {"ResNet18": resnet.ResNet18,
           "ResNet50": resnet.ResNet50, 
           "ResNet101": resnet.ResNet101,
           "rnn": rnn.MyRNN,
-          "MyCNN": mycnn.MyCNN,
+          "CNN": mycnn.CNN,
           "LSTM": rnn.LSTMLaneFollower}
 
 ### Agent Memory ###
@@ -84,7 +85,7 @@ class Learner:
         )
         self.model_name = model_name
         self.driving_model = models[model_name]()
-        print(self.driving_model)
+        # print(self.driving_model)
 
         # open and write to file to track progress
         now = datetime.datetime.now()
@@ -178,19 +179,16 @@ class Learner:
         resized_img = cv2.resize(img, (32, 30))
         return resized_img
 
-    def _grab_and_preprocess_obs_(self, resize=True, augment=True):
+    def _grab_and_preprocess_obs_(self, augment=True):
         full_obs = self.car.observations[self.camera.name]
         cropped_obs = self._preprocess_(full_obs)
+        resized_obs = self._resize_image(cropped_obs)
         if augment:
-            augmented_obs = self._augment_image(cropped_obs)
+            augmented_obs = self._augment_image(resized_obs)
             return augmented_obs.permute(1,2,0)
-        elif resize:
-            resized_obs = self._resize_image(cropped_obs)
-            resized_obs = resized_obs / 255.0
-            return torch.from_numpy(resized_obs).to(torch.float32)
         else:
-            cropped_obs = cropped_obs / 255.0
-            return torch.from_numpy(cropped_obs).to(torch.float32)
+            resized_obs_torch = resized_obs / 255.0
+            return resized_obs, torch.from_numpy(resized_obs_torch).to(torch.float32)
 
     ### Training step (forward and backpropagation) ###
     def _train_step_(self, optimizer, observations, actions, discounted_rewards):
@@ -257,7 +255,7 @@ class Learner:
             # Restart the environment
             self._vista_reset_()
             memory.clear()
-            observation = self._grab_and_preprocess_obs_(resize=True, augment=False)     
+            _, observation = self._grab_and_preprocess_obs_(augment=False)     
             # print(f"obs shape: {observation.shape}")       
             steps = 0
             # plt.imsave(f"frames/{self.model_name}_train_{i_episode}_{steps}_{self.timestamp}.png", observation.numpy())
@@ -268,13 +266,11 @@ class Learner:
                 curvature_action = curvature_dist.sample()[0, 0]
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
-                observation = self._grab_and_preprocess_obs_(resize=True, augment=False)
-
-                # aug_observation = self._grab_and_preprocess_obs_(augment=False)
+                np_obs, observation = self._grab_and_preprocess_obs_(augment=False)
+                aug_observation = self._augment_image(np_obs).permute(1,2,0) # self._grab_and_preprocess_obs_(augment=True)
                 reward = 1.0 if not self._check_crash_() else 0.0
                 # add to memory
-                # memory.add_to_memory(observation, curvature_action, reward)
-                memory.add_to_memory(observation, curvature_action, reward)
+                memory.add_to_memory(aug_observation, curvature_action, reward)
                 steps += 1
                 # plt.imsave(f"frames/{self.model_name}_train_{i_episode}_{steps}_{self.timestamp}.png", aug_observation.numpy())
                 # is the episode over? did you crash or do so well that you're done?
