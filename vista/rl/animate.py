@@ -16,7 +16,7 @@ def main(args):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         image_frames.append(img)
 
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(image_frames[0].shape[1] / 100, image_frames[0].shape[0] / 100))
     ln = plt.imshow(image_frames[0])
     plt.axis('off')
     def init():
@@ -25,14 +25,17 @@ def main(args):
 
     def update(frame):
         ln.set_array(frame)
+        plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        plt.margins(0, 0)
         return [ln]
 
     ani = FuncAnimation(fig, update, image_frames, init_func=init, blit=True)
-    ani.save("movie.mp4", fps=20)
+    ani.save(f"{args.fname}.mp4", fps=10)
 
    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Animator to visualize VISTA frames")
     parser.add_argument('--frames_folder')
+    parser.add_argument('--fname', type=str)
     args = parser.parse_args()
     main(args)
