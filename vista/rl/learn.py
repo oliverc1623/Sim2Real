@@ -85,24 +85,30 @@ class Learner:
         )
         self.model_name = model_name
         self.driving_model = models[model_name]().to(device)
-        # print(self.driving_model)
-
-        # open and write to file to track progress
-        now = datetime.datetime.now()
-        self.timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
-        filename = f"results/{model_name}_results_{self.timestamp}.txt"
-        self.f = open(filename, "w") 
-        self.f.write("reward\tloss\tsteps\n")
-        self.model_name = model_name
-
+        
         # hyperparameters
         self.learning_rate = learning_rate
         self.max_curvature = max_curvature
         self.max_std = max_std
         self.episodes = episodes
         self.clip = clip
-        
 
+        self._write_file_()
+        
+    def _write_file_(self):
+        # open and write to file to track progress
+        now = datetime.datetime.now()
+        self.timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
+        results_dir = "results"
+        model_results_dir = results_dir + f"/{self.model_name}/"
+        if not os.path.exists(model_results_dir):
+            os.makedirs(model_results_dir)
+        filename = f"{self.model_name}_{self.learning_rate}_{self.clip}_results_{self.timestamp}.txt"
+        # Define the file path
+        file_path = os.path.join(model_results_dir, filename)
+        self.f = open(file_path, "w") 
+        self.f.write("reward\tloss\tsteps\n")
+        
     def _vista_reset_(self):
         self.world.reset()
         self.display.reset()
@@ -266,11 +272,11 @@ class Learner:
                 # Step the simulated car with the same action
                 self._vista_step_(curvature_action)
                 np_obs, observation = self._grab_and_preprocess_obs_(augment=False)
-                aug_observation = self._augment_image(np_obs).permute(1,2,0) # self._grab_and_preprocess_obs_(augment=True)
+                # aug_observation = self._augment_image(np_obs).permute(1,2,0) # self._grab_and_preprocess_obs_(augment=True)
                 reward = 1.0 if not self._check_crash_() else 0.0
                 # reward = torch.tensor(reward).to(device)
                 # add to memory
-                memory.add_to_memory(aug_observation, curvature_action, reward)
+                memory.add_to_memory(observation, curvature_action, reward)
                 steps += 1
                 # plt.imsave(f"frames/{self.model_name}_train_{i_episode}_{steps}_{self.timestamp}.png", aug_observation.numpy())
                 # is the episode over? did you crash or do so well that you're done?
