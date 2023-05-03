@@ -218,7 +218,7 @@ class Learner:
             self.display.render()
             plt.tight_layout(pad=0)
             plt.savefig(
-                self.model_frame_dir + f"frame_episode_{i}_step_{s}.png", bbox_inches="tight",)
+                self.model_frame_dir + f"frame_episode_{i:03d}_step_{s:04d}.png", bbox_inches="tight",)
         if augment:
             augmented_obs = self._augment_image(resized_obs)
             return augmented_obs.permute(1, 2, 0).to(device)
