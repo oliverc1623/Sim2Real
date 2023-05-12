@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 
-import torch.nn as nn
-
 class CNN(nn.Module):
     def __init__(self):
         super(CNN, self).__init__()
@@ -25,9 +23,8 @@ class CNN(nn.Module):
         self.conv5 = nn.Conv2d(256, 2, kernel_size=3, stride=1, padding=1)
         self.norm5 = nn.GroupNorm(1, 2)
         self.relu5 = nn.ReLU(inplace=True)
-
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(2, 2)
+        
+        self.fc = nn.Linear(2 * 32 * 30, 2)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -49,11 +46,11 @@ class CNN(nn.Module):
         x = self.conv5(x)
         x = self.norm5(x)
         x = self.relu5(x)
-        
-        x = self.global_avg_pool(x)
+
         x = x.reshape(x.size(0), -1)
         x = self.fc(x)
-        return x
+        mu, log_sigma = torch.chunk(x, 2, dim=-1)
+        return mu, log_sigma
 
 
 class LSTM(nn.Module):
