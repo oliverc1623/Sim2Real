@@ -187,7 +187,7 @@ def main():
         count = 0
         while count < 200 and not done:
             for t in range(rollout_len):
-                mu, std = model.pi(torch.from_numpy(s).float())
+                mu, std = model.pi(s)
                 print(f"mu: {mu}\n std: {std}")
                 dist = Normal(mu, std)
                 a = dist.sample()
