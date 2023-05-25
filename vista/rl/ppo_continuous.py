@@ -50,6 +50,11 @@ class PPO(nn.Module):
         self.optimization_step = 0
 
     def pi(self, x):
+        single_image_input = len(x.shape) == 3  # missing 4th batch dimension
+        if single_image_input:
+            x = x.unsqueeze(0)
+        x = x.permute(0, 3, 1, 2)
+
         x = self.relu1(self.norm1(self.conv1(x)))
         x = self.relu2(self.norm2(self.conv2(x)))
         x = self.relu3(self.norm3(self.conv3(x)))
@@ -175,24 +180,29 @@ def main():
         world, display_config={"gui_scale": 2, "vis_full_frame": False}
     )
 
-    model = PPO()
+    model = PPO().to(device)
     score = 0.0
     print_interval = 20
     rollout = []
 
     for n_epi in range(500):
+        print(f"Episode: {n_epi}")
         vista_reset(world, display)
-        s = grab_and_preprocess_obs(car, camera)
+        s = grab_and_preprocess_obs(car, camera).to(device)
         done = False
+        crash = check_crash(car)
         count = 0
-        while count < 200 and not done:
+        while count < 200 and not done and not crash:
             for t in range(rollout_len):
                 mu, std = model.pi(s)
-                print(f"mu: {mu}\n std: {std}")
                 dist = Normal(mu, std)
                 a = dist.sample()
                 log_prob = dist.log_prob(a)
-                s_prime, r, done, truncated, info = env.step([a.item()])
+                vista_step(car, curvature = a.item())
+                s_prime = grab_and_preprocess_obs(car, camera).to(device)
+                r = calculate_reward(car)
+                done = car.done
+                crash = check_crash(car)
 
                 rollout.append((s, a, r/10.0, s_prime, log_prob.item(), done))
                 if len(rollout) == rollout_len:
