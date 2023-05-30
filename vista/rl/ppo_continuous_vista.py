@@ -21,7 +21,7 @@ lmbda           = 0.9
 eps_clip        = 0.2
 K_epoch         = 10
 rollout_len    = 3
-buffer_size    = 5
+buffer_size    = 3
 minibatch_size = 32
 
 class PPO(nn.Module):
@@ -54,8 +54,9 @@ class PPO(nn.Module):
         single_image_input = len(x.shape) == 3  # missing 4th batch dimension
         if single_image_input:
             x = x.unsqueeze(0)
-        x = x.permute(0, 3, 1, 2)
-
+            x = x.permute(0, 3, 1, 2)
+        else:
+            x = x.view(x.shape[0] * x.shape[1], 3, 30, 32)
         x = self.relu1(self.norm1(self.conv1(x)))
         x = self.relu2(self.norm2(self.conv2(x)))
         x = self.relu3(self.norm3(self.conv3(x)))
@@ -70,10 +71,6 @@ class PPO(nn.Module):
         return mu, sigma
     
     def v(self, x):
-        # single_image_input = len(x.shape) == 3  # missing 4th batch dimension
-        # if single_image_input:
-        #     x = x.unsqueeze(0)
-        # x = x.permute(0, 3, 1, 2)
         x = x.view(x.shape[0]*x.shape[1], 3, 30, 32)
         x = self.relu1(self.norm1(self.conv1(x)))
         x = self.relu2(self.norm2(self.conv2(x)))
@@ -82,7 +79,6 @@ class PPO(nn.Module):
         x = self.relu5(self.norm5(self.conv5(x)))
         x = x.reshape(x.size(0), -1)
         v = self.fc_v(x)
-        print(f"v shape: {v.shape}")
         return v
       
     def put_data(self, transition):
@@ -119,11 +115,17 @@ class PPO(nn.Module):
             flatten_s_batch = torch.stack(flatten_s_batch).view(len(s_batch), 3, 30, 32, 3)
 
             flatten_s_prime_batch = [item for sublist in s_prime_batch for item in sublist]
+            # to shape (mini_batch_size, rollout_len, 30, 32, 3)
             flatten_s_prime_batch = torch.stack(flatten_s_prime_batch).view(len(s_batch), 3, 30, 32, 3)
 
+            r = torch.tensor(r_batch, dtype=torch.float).to(device)
+            r = r.view(r.shape[0]*r.shape[1], 1)
+            d = torch.tensor(done_batch, dtype=torch.float).to(device)
+            d = d.view(d.shape[0]*d.shape[1], 1)
+
             mini_batch = flatten_s_batch, torch.tensor(a_batch, dtype=torch.float).to(device), \
-                          torch.tensor(r_batch, dtype=torch.float).to(device), flatten_s_prime_batch, \
-                          torch.tensor(done_batch, dtype=torch.float).to(device), torch.tensor(prob_a_batch, dtype=torch.float).to(device)
+                          r, flatten_s_prime_batch, \
+                          d, torch.tensor(prob_a_batch, dtype=torch.float).to(device)
             data.append(mini_batch)
 
         return data
@@ -133,14 +135,9 @@ class PPO(nn.Module):
         for mini_batch in data:
             s, a, r, s_prime, done_mask, old_log_prob = mini_batch
             with torch.no_grad():
-                print(f"s_prime shape: {s_prime.shape}")
-                r = r.view(r.shape[0]*r.shape[1], 1)
-                done_mask = done_mask.view(done_mask.shape[0]*done_mask.shape[1], 1)
-                print(f"r shape: {r.shape}")
-                print(f"done_mask shape: {done_mask.shape}")
                 td_target = r + gamma * self.v(s_prime) * done_mask
                 delta = td_target - self.v(s)
-            delta = delta.numpy() # TODO: fix here
+            delta = delta.cpu().numpy() # TODO: fix here
 
             advantage_lst = []
             advantage = 0.0
@@ -162,22 +159,21 @@ class PPO(nn.Module):
             for i in range(K_epoch):
                 for mini_batch in data:
                     s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage = mini_batch
-                    print(f"s shape: {s.shape}")
-                    print(f"a shape: {a.shape}")
+                    a = a.view(a.shape[0] * a.shape[1], 1)
                     mu, std = self.pi(s)
                     dist = Normal(mu, std)
                     log_prob = dist.log_prob(a)
+                    old_log_prob = old_log_prob.view(old_log_prob.shape[0]*old_log_prob.shape[1], 1)
                     ratio = torch.exp(log_prob - old_log_prob)  # a/b == exp(log(a)-log(b))
 
-                    surr1 = ratio * advantage
-                    surr2 = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * advantage
+                    surr1 = ratio * advantage.to(device)
+                    surr2 = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * advantage.to(device)
                     loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(self.v(s) , td_target)
 
                     self.optimizer.zero_grad()
                     loss.mean().backward()
                     nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                     self.optimizer.step()
-                    print("optimizing")
                     self.optimization_step += 1
 
 def main():
@@ -216,7 +212,8 @@ def main():
         done = False
         crash = check_crash(car)
         count = 0
-        while count < 200 and not done and not crash:
+        print(f"car crashed: {crash}")
+        while not done and not crash:
             for t in range(rollout_len):
                 mu, std = model.pi(s)
                 dist = Normal(mu, std)
@@ -237,13 +234,13 @@ def main():
                 score += r
                 count += 1
 
-            model.train_net()
+            model.train_net() # we could still update model in the middle of driving... wait would we want to do this?
+        print(f"car crashed: {crash}, after {count} steps")
+
 
         if n_epi%print_interval==0 and n_epi!=0:
             print("# of episode :{}, avg score : {:.1f}, optmization step: {}".format(n_epi, score/print_interval, model.optimization_step))
             score = 0.0
-
-    env.close()
 
 if __name__ == '__main__':
     main()
