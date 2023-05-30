@@ -4,15 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
-import vista
-import os
 import matplotlib.pyplot as plt
-import numpy as np
-from vista_helper import *
-
-device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-device = torch.device(device)
-print(f"Using {device} device")
 
 #Hyperparameters
 learning_rate  = 0.0003
@@ -29,48 +21,23 @@ class PPO(nn.Module):
         super(PPO, self).__init__()
         self.data = []
         
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
-        self.norm1 = nn.GroupNorm(8, 32)
-        self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.norm2 = nn.GroupNorm(16, 64)
-        self.relu2 = nn.ReLU()
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.norm3 = nn.GroupNorm(32, 128)
-        self.relu3 = nn.ReLU()
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
-        self.norm4 = nn.GroupNorm(64, 256)
-        self.relu4 = nn.ReLU()
-        self.conv5 = nn.Conv2d(256, 2, kernel_size=3, stride=1, padding=1)
-        self.norm5 = nn.GroupNorm(1, 2)
-        self.relu5 = nn.ReLU()
-        self.fc = nn.Linear(2 * 32 * 30, 2)
-
+        self.fc1   = nn.Linear(3,128)
+        self.fc_mu = nn.Linear(128,1)
+        self.fc_std  = nn.Linear(128,1)
+        self.fc_v = nn.Linear(128,1)
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         self.optimization_step = 0
 
-    def pi(self, x):
-        single_image_input = len(x.shape) == 3  # missing 4th batch dimension
-        if single_image_input:
-            x = x.unsqueeze(0)
-        x = x.permute(0, 3, 1, 2)
-
-        x = self.relu1(self.norm1(self.conv1(x)))
-        x = self.relu2(self.norm2(self.conv2(x)))
-        x = self.relu3(self.norm3(self.conv3(x)))
-        x = self.relu4(self.norm4(self.conv4(x)))
-        x = self.relu5(self.norm5(self.conv5(x)))
-        x = x.reshape(x.size(0), -1)
-        x = self.fc(x)
-
-        mu, log_sigma = torch.chunk(x, 2, dim=-1)
-        mu = 1/8.0 * torch.tanh(mu)  # conversion
-        sigma = 0.1 * torch.sigmoid(log_sigma) + 0.005  # conversion
-        return mu, sigma
+    def pi(self, x, softmax_dim = 0):
+        x = F.relu(self.fc1(x))
+        mu = 2.0*torch.tanh(self.fc_mu(x))
+        std = F.softplus(self.fc_std(x))
+        return mu, std
     
     def v(self, x):
         x = F.relu(self.fc1(x))
         v = self.fc_v(x)
+        print(f"v shape: {v.shape}")
         return v
       
     def put_data(self, transition):
@@ -84,7 +51,7 @@ class PPO(nn.Module):
             for i in range(minibatch_size):
                 rollout = self.data.pop()
                 s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst = [], [], [], [], [], []
-
+                print(f"roll out len: {len(rollout)}")
                 for transition in rollout:
                     s, a, r, s_prime, prob_a, done = transition
                     
@@ -102,7 +69,6 @@ class PPO(nn.Module):
                 s_prime_batch.append(s_prime_lst)
                 prob_a_batch.append(prob_a_lst)
                 done_batch.append(done_lst)
-                    
             mini_batch = torch.tensor(s_batch, dtype=torch.float), torch.tensor(a_batch, dtype=torch.float), \
                           torch.tensor(r_batch, dtype=torch.float), torch.tensor(s_prime_batch, dtype=torch.float), \
                           torch.tensor(done_batch, dtype=torch.float), torch.tensor(prob_a_batch, dtype=torch.float)
@@ -114,7 +80,10 @@ class PPO(nn.Module):
         data_with_adv = []
         for mini_batch in data:
             s, a, r, s_prime, done_mask, old_log_prob = mini_batch
+            print(f"num states in mini batch in calc advantage: {len(s)}")
             with torch.no_grad():
+                print(f"r shape: {r.shape}")
+                print(f"s_prime shape: {s_prime.shape}")
                 td_target = r + gamma * self.v(s_prime) * done_mask
                 delta = td_target - self.v(s)
             delta = delta.numpy()
@@ -154,59 +123,31 @@ class PPO(nn.Module):
                     nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                     self.optimizer.step()
                     self.optimization_step += 1
-
+        
 def main():
-    # Set up VISTA simulator
-    trace_root = "../trace"
-    trace_path = [
-        "20210726-154641_lexus_devens_center",
-        "20210726-155941_lexus_devens_center_reverse",
-        "20210726-184624_lexus_devens_center",
-        "20210726-184956_lexus_devens_center_reverse",
-    ]
-    trace_path = [os.path.join(trace_root, p) for p in trace_path]
-    world = vista.World(trace_path, trace_config={"road_width": 4})
-    car = world.spawn_agent(
-        config={
-            "length": 5.0,
-            "width": 2.0,
-            "wheel_base": 2.78,
-            "steering_ratio": 14.7,
-            "lookahead_road": True,
-        }
-    )
-    camera = car.spawn_camera(config={"size": (200, 320)})
-    display = vista.Display(
-        world, display_config={"gui_scale": 2, "vis_full_frame": False}
-    )
-
-    model = PPO().to(device)
+    env = gym.make('Pendulum-v1', render_mode="rgb_array")
+    model = PPO()
     score = 0.0
     print_interval = 20
     rollout = []
 
-    for n_epi in range(500):
-        print(f"Episode: {n_epi}")
-        vista_reset(world, display)
-        s = grab_and_preprocess_obs(car, camera).to(device)
+    for n_epi in range(5):
+        s, _ = env.reset()
         done = False
-        crash = check_crash(car)
         count = 0
-        while count < 200 and not done and not crash:
+        while count < 200 and not done:
             for t in range(rollout_len):
-                mu, std = model.pi(s)
+                print(t)
+                mu, std = model.pi(torch.from_numpy(s).float())
                 dist = Normal(mu, std)
                 a = dist.sample()
                 log_prob = dist.log_prob(a)
-                vista_step(car, curvature = a.item())
-                s_prime = grab_and_preprocess_obs(car, camera).to(device)
-                r = calculate_reward(car)
-                done = car.done
-                crash = check_crash(car)
-
+                s_prime, r, done, truncated, info = env.step([a.item()])
                 rollout.append((s, a, r/10.0, s_prime, log_prob.item(), done))
                 if len(rollout) == rollout_len:
                     model.put_data(rollout)
+                    print(f"roll out len: {len(rollout)}")
+                    print(f"data len: {len(model.data)}")
                     rollout = []
 
                 s = s_prime
