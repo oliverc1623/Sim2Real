@@ -5,18 +5,21 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 import vista
+import logging
+logging.getLogger("vista").disabled = True
 import os
 import matplotlib.pyplot as plt
 import numpy as np
 from vista_helper import *
+import datetime
 
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 device = torch.device(device)
 print(f"Using {device} device")
 
 #Hyperparameters
-learning_rate  = 0.0003
-gamma           = 0.9
+learning_rate  = 0.0005
+gamma           = 0.95
 lmbda           = 0.9
 eps_clip        = 0.2
 K_epoch         = 10
@@ -137,7 +140,7 @@ class PPO(nn.Module):
             with torch.no_grad():
                 td_target = r + gamma * self.v(s_prime) * done_mask
                 delta = td_target - self.v(s)
-            delta = delta.cpu().numpy() # TODO: fix here
+            delta = delta.cpu().numpy() 
 
             advantage_lst = []
             advantage = 0.0
@@ -149,7 +152,6 @@ class PPO(nn.Module):
             data_with_adv.append((s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage))
 
         return data_with_adv
-
 
     def train_net(self):
         if len(self.data) == minibatch_size * buffer_size:
@@ -201,31 +203,50 @@ def main():
         world, display_config={"gui_scale": 2, "vis_full_frame": False}
     )
 
+    # open and write to file to track progress
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
+    results_dir = "results"
+    model_results_dir = results_dir + f"/PPO/"
+
+    frames_dir = "frames"
+    model_frame_dir = (frames_dir + f"/PPO_frames_{timestamp}/")
+    animate = False # TODO: make into argument
+    if animate and not os.path.exists(model_frame_dir):
+        os.makedirs(model_frame_dir)
+
+    if not os.path.exists(model_results_dir):
+        os.makedirs(model_results_dir)
+    filename = f"CNN_PPO_{learning_rate}_results_{timestamp}.txt"
+    # Define the file path
+    file_path = os.path.join(model_results_dir, filename)
+    f = open(file_path, "w")
+
     model = PPO().to(device)
     score = 0.0
-    print_interval = 20
+    print_interval = 1
     rollout = []
 
     for n_epi in range(10000):
+        print(f"episode: {n_epi}")
         vista_reset(world, display)
         s = grab_and_preprocess_obs(car, camera).to(device)
         done = False
         crash = check_crash(car)
         count = 0
-        print(f"car crashed: {crash}")
-        while not done and not crash:
-            for t in range(rollout_len):
+        while not crash:
+            for t in range(rollout_len): 
                 mu, std = model.pi(s)
                 dist = Normal(mu, std)
                 a = dist.sample()
                 log_prob = dist.log_prob(a)
                 vista_step(car, curvature = a.item())
                 s_prime = grab_and_preprocess_obs(car, camera).to(device)
-                done = car.done
+                done = car.done 
                 crash = check_crash(car)
                 r = calculate_reward(car) if not crash else 0.0 
 
-                rollout.append((s, a[0], r, s_prime, log_prob.item(), done))
+                rollout.append((s, a[0], r, s_prime, log_prob.item(), crash))
                 if len(rollout) == rollout_len:
                     model.put_data(rollout)
                     rollout = []
@@ -234,12 +255,17 @@ def main():
                 score += r
                 count += 1
 
-            model.train_net() # we could still update model in the middle of driving... wait would we want to do this?
-        print(f"car crashed: {crash}, after {count} steps")
+                if crash:
+                    break
 
+            model.train_net() # we could still update model in the middle of driving... wait would we want to do this?
 
         if n_epi%print_interval==0 and n_epi!=0:
-            print("# of episode :{}, avg score : {:.1f}, optmization step: {}".format(n_epi, score/print_interval, model.optimization_step))
+            result = "# of episode :{}, avg score : {:.1f}, optmization step: {}\n".format(n_epi, 
+                                                                                        score/print_interval, 
+                                                                                        model.optimization_step)
+            print(result)
+            f.write(result)
             score = 0.0
 
 if __name__ == '__main__':
