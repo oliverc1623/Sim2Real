@@ -14,8 +14,8 @@ def grab_and_preprocess_obs(car, camera):
     cropped_obs = preprocess(full_obs, camera)
     resized_obs = cv2.resize(cropped_obs, (32, 30))
     resized_obs = resized_obs / 255.0
-    torch.from_numpy(resized_obs).to(torch.float32)
-    return resized_obs
+    torch_obs = torch.from_numpy(resized_obs).to(torch.float32)
+    return torch_obs
 
 def vista_reset(world, display):
     world.reset()
