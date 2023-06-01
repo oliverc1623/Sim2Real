@@ -7,26 +7,30 @@ import vista
 import os
 from vista_helper import *
 from replay_memory import Memory
+import math
+from common import estimate_advantages
 
+dtype = torch.float32
+torch.set_default_dtype(dtype)
 device = ("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 device = torch.device(device)
 print(f"Using {device} device")
 
 #Hyperparameters
-learning_rate  = 0.0005
+learning_rate   = 0.0005
 gamma           = 0.95
 lmbda           = 0.9
+tau             = 0.95
 eps_clip        = 0.2
 K_epoch         = 10
-rollout_len    = 3
-buffer_size    = 3
-minibatch_size = 32
+minibatch_size  = 128
+optim_batch_size = 32
 
 class PPO(nn.Module):
     def __init__(self):
         super(PPO, self).__init__()
         self.data = []
-        
+
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1)
         self.norm1 = nn.GroupNorm(8, 32)
         self.relu1 = nn.ReLU()
@@ -52,9 +56,7 @@ class PPO(nn.Module):
         single_image_input = len(x.shape) == 3  # missing 4th batch dimension
         if single_image_input:
             x = x.unsqueeze(0)
-            x = x.permute(0, 3, 1, 2)
-        else:
-            x = x.view(x.shape[0] * x.shape[1], 3, 30, 32)
+        x = x.permute(0, 3, 1, 2)
         x = self.relu1(self.norm1(self.conv1(x)))
         x = self.relu2(self.norm2(self.conv2(x)))
         x = self.relu3(self.norm3(self.conv3(x)))
@@ -69,7 +71,7 @@ class PPO(nn.Module):
         return mu, sigma
     
     def v(self, x):
-        x = x.view(x.shape[0]*x.shape[1], 3, 30, 32)
+        x = x.permute(0,3,1,2)
         x = self.relu1(self.norm1(self.conv1(x)))
         x = self.relu2(self.norm2(self.conv2(x)))
         x = self.relu3(self.norm3(self.conv3(x)))
@@ -78,134 +80,111 @@ class PPO(nn.Module):
         x = x.reshape(x.size(0), -1)
         v = self.fc_v(x)
         return v
-      
-    def put_data(self, transition):
-        self.data.append(transition)
-        
-    def make_batch(self):
-        s_batch, a_batch, r_batch, s_prime_batch, prob_a_batch, done_batch = [], [], [], [], [], []
-        data = []
 
-        for j in range(buffer_size):
-            for i in range(minibatch_size):
-                rollout = self.data.pop()
-                s_lst, a_lst, r_lst, s_prime_lst, prob_a_lst, done_lst = [], [], [], [], [], []
+    def collect_samples(self, mini_batch_size, world, display, car, camera):
+        log = dict()
+        memory = Memory()
+        num_steps = 0
+        total_reward = 0
+        num_episodes = 0
+        while num_steps < mini_batch_size:
+            vista_reset(world, display)
+            s = grab_and_preprocess_obs(car, camera).to(device)
+            reward_episode = 0
+            for t in range(10000):
+                mu, std = self.pi(s)
+                dist = Normal(mu, std)
+                a = dist.sample()
+                log_prob = dist.log_prob(a)
+                vista_step(car, curvature = a.item())
+                s_prime = grab_and_preprocess_obs(car, camera).to(device)
+                r = calculate_reward(car)
+                reward_episode += r
+                crash = check_crash(car)
+                mask = 0 if crash else 1
+                memory.push(s, a, mask, s_prime, r, log_prob.item())
+                if crash:
+                    break
+                s = s_prime
+            # log stats
+            num_steps += (t + 1)
+            num_episodes += 1
+            total_reward += reward_episode
+        log['num_steps'] = num_steps
+        log['num_episodes'] = num_episodes
+        log['total_reward'] = total_reward.item()
+        log['avg_reward'] = (total_reward / num_episodes).item()
+        return memory.sample(), log
 
-                for transition in rollout:
-                    s, a, r, s_prime, prob_a, done = transition
-                    
-                    s_lst.append(s)
-                    a_lst.append([a])
-                    r_lst.append([r])
-                    s_prime_lst.append(s_prime)
-                    prob_a_lst.append([prob_a])
-                    done_mask = 0 if done else 1
-                    done_lst.append([done_mask])
+    def ppo_step(self, states, actions, advantages, fixed_log_probs, clip_epsilon, td_target):
+        """update policy"""
+        mu, std = self.pi(states)
+        dist = Normal(mu, std)
+        log_probs = dist.log_prob(actions)
+        ratio = torch.exp(log_probs - fixed_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
+        vs = self.v(states)
+        loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(vs , td_target)
+        self.optimizer.zero_grad()
+        loss.mean().backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 40.0)
+        self.optimizer.step()
+        self.optimization_step += 1
 
-                s_batch.append(s_lst)
-                a_batch.append(a_lst)
-                r_batch.append(r_lst)
-                s_prime_batch.append(s_prime_lst)
-                prob_a_batch.append(prob_a_lst)
-                done_batch.append(done_lst)
+    def calc_advantages(self, s, a, r, s_prime, done_mask):
+        with torch.no_grad():
+            td_target = r + gamma * self.v(s_prime) * done_mask
+            delta = td_target - self.v(s)
+        delta = delta.cpu().numpy()
 
-            flatten_s_batch = [item for sublist in s_batch for item in sublist]
-            flatten_s_batch = torch.stack(flatten_s_batch).view(len(s_batch), 3, 30, 32, 3)
+        advantage_lst = []
+        advantage = 0.0
+        for delta_t in delta[::-1]:
+            advantage = gamma * lmbda * advantage + delta_t[0]
+            advantage_lst.append([advantage])
+        advantage_lst.reverse()
+        advantage = torch.tensor(advantage_lst, dtype=torch.float)
+        return advantage, td_target
 
-            flatten_s_prime_batch = [item for sublist in s_prime_batch for item in sublist]
-            # to shape (mini_batch_size, rollout_len, 30, 32, 3)
-            flatten_s_prime_batch = torch.stack(flatten_s_prime_batch).view(len(s_batch), 3, 30, 32, 3)
+    def update_params(self, batch, i_iter):
+        states = torch.stack(batch.state)
+        actions = torch.stack(batch.action).to(dtype).squeeze(1).to(device)
+        rewards = torch.from_numpy(np.stack(batch.reward)).to(dtype).to(device).unsqueeze(1)
+        masks = torch.from_numpy(np.stack(batch.mask)).to(dtype).to(device).unsqueeze(1)
+        fixed_log_probs = torch.from_numpy(np.stack(batch.log_probs)).to(dtype).to(device)
+        s_primes = torch.stack(batch.next_state)
+        # ** Might need to implement another way to get fixed log probs**
+        """get advantage estimation from the trajectories"""
+        advantages, td_target = self.calc_advantages(states, actions, rewards, s_primes, masks)
+        advantages = advantages.to(device)
+        td_target = td_target.to(device)
 
-            r = torch.tensor(r_batch, dtype=torch.float).to(device)
-            r = r.view(r.shape[0]*r.shape[1], 1)
-            d = torch.tensor(done_batch, dtype=torch.float).to(device)
-            d = d.view(d.shape[0]*d.shape[1], 1)
+        """perform mini-batch PPO update"""
+        optim_iter_num = int(math.ceil(states.shape[0] / optim_batch_size))
+        # print(f"optim iter: {optim_iter_num}")
+        for _ in range(K_epoch):
+            perm = np.arange(states.shape[0])
+            np.random.shuffle(perm)
+            perm = torch.LongTensor(perm).to(device)
 
-            mini_batch = flatten_s_batch, torch.tensor(a_batch, dtype=torch.float).to(device), \
-                          r, flatten_s_prime_batch, \
-                          d, torch.tensor(prob_a_batch, dtype=torch.float).to(device)
-            data.append(mini_batch)
+            states, actions, advantages, fixed_log_probs, td_target = \
+                states[perm].clone(), actions[perm].clone(), advantages[perm].clone(), fixed_log_probs[perm].clone(), \
+                td_target[perm].clone()
+            
+            for i in range(optim_iter_num):
+                ind = slice(i * optim_batch_size, min((i + 1) * optim_batch_size, states.shape[0]))
+                states_b, actions_b, advantages_b, fixed_log_probs_b, td_target_b = \
+                    states[ind], actions[ind], advantages[ind], fixed_log_probs[ind], td_target[ind]
 
-        return data
-
-    def calc_advantage(self, data):
-        data_with_adv = []
-        for mini_batch in data:
-            s, a, r, s_prime, done_mask, old_log_prob = mini_batch
-            with torch.no_grad():
-                td_target = r + gamma * self.v(s_prime) * done_mask
-                delta = td_target - self.v(s)
-            delta = delta.cpu().numpy() 
-
-            advantage_lst = []
-            advantage = 0.0
-            for delta_t in delta[::-1]:
-                advantage = gamma * lmbda * advantage + delta_t[0]
-                advantage_lst.append([advantage])
-            advantage_lst.reverse()
-            advantage = torch.tensor(advantage_lst, dtype=torch.float)
-            data_with_adv.append((s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage))
-
-        return data_with_adv
-
-    def train_net(self):
-        if len(self.data) == minibatch_size * buffer_size:
-            data = self.make_batch()
-            data = self.calc_advantage(data)
-
-            for i in range(K_epoch):
-                for mini_batch in data:
-                    s, a, r, s_prime, done_mask, old_log_prob, td_target, advantage = mini_batch
-                    a = a.view(a.shape[0] * a.shape[1], 1)
-                    mu, std = self.pi(s)
-                    dist = Normal(mu, std)
-                    log_prob = dist.log_prob(a)
-                    old_log_prob = old_log_prob.view(old_log_prob.shape[0]*old_log_prob.shape[1], 1)
-                    ratio = torch.exp(log_prob - old_log_prob)  # a/b == exp(log(a)-log(b))
-
-                    surr1 = ratio * advantage.to(device)
-                    surr2 = torch.clamp(ratio, 1-eps_clip, 1+eps_clip) * advantage.to(device)
-                    loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(self.v(s) , td_target)
-
-                    self.optimizer.zero_grad()
-                    loss.mean().backward()
-                    nn.utils.clip_grad_norm_(self.parameters(), 1.0)
-                    self.optimizer.step()
-                    self.optimization_step += 1
-
-def collect_samples(mini_batch_size, model, world, display, car, camera):
-    log = dict()
-    memory = Memory()
-    num_steps = 0
-    total_reward = 0
-    num_episodes = 0
-    while num_steps < mini_batch_size:
-        vista_reset(world, display)
-        s = grab_and_preprocess_obs(car, camera)
-        reward_episode = 0
-        for t in range(10000):
-            mu, std = model.pi(s)
-            dist = Normal(mu, std)
-            a = dist.sample()
-            log_prob = dist.log_prob(a)
-            vista_step(car, curvature = a.item())
-            s_prime = grab_and_preprocess_obs(car, camera).to(device)
-            r = calculate_reward(car)
-            reward_episode += r
-            crash = check_crash(car)
-            mask = 0 if crash else 1
-            memory.push(s, a, mask, s_prime, r)
-            if crash:
-                break
-            s = s_prime
-        # log stats
-        num_steps += (t + 1)
-        num_episodes += 1
-    log['num_steps'] = num_steps
-    log['num_episodes'] = num_episodes
-    log['total_reward'] = total_reward
-    log['avg_reward'] = total_reward / num_episodes
-    return memory, log
+                self.ppo_step(states_b, actions_b, advantages_b, fixed_log_probs_b, eps_clip, td_target_b)
+                # Check gradients norms
+                # total_norm = 0
+                # for n, p in self.named_parameters():
+                #     param_norm = p.grad.data.norm(2) # calculate the L2 norm of gradients
+                #     total_norm += param_norm.item() ** 2 # accumulate the squared norm
+                # total_norm = total_norm ** 0.5 # take the square root to get the total norm
+                # print(f"Total gradient norm: {total_norm}")
 
 def main():
     # Set up VISTA simulator
@@ -233,12 +212,12 @@ def main():
     )
 
     model = PPO().to(device)
-    score = 0.0
-    print_interval = 1
-    rollout = []
 
     for n_epi in range(500):
-        batch = collect_samples(minibatch_size, model, world, display, car, camera)
+        print(f"Episode: {n_epi}")
+        batch, log = model.collect_samples(minibatch_size, world, display, car, camera)
+        print(log)
+        model.update_params(batch, n_epi)
 
 if __name__ == '__main__':
     main()
