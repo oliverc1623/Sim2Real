@@ -116,18 +116,14 @@ class PPO(nn.Module):
         log['avg_reward'] = (total_reward / num_episodes).item()
         return memory.sample(), log
 
-    def a2c_step(self, states, actions, advantages, fixed_log_probs, clip_epsilon, td_target):
+    def a2c_step(self, states, actions, advantages, td_target):
         """update policy"""
         mu, std = self.pi(states)
         dist = Normal(mu, std)
         log_probs = dist.log_prob(actions)
-        ratio = torch.exp(log_probs - fixed_log_probs)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantages
-        vs = self.v(states)
-        loss = -torch.min(surr1, surr2) + F.smooth_l1_loss(vs , td_target)
+        loss = -(log_probs*advantages).mean() + F.smooth_l1_loss(self.v(states) , td_target)
         self.optimizer.zero_grad()
-        loss.mean().backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), 40.0)
         self.optimizer.step()
         self.optimization_step += 1
