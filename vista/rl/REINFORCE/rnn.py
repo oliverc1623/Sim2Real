@@ -28,11 +28,11 @@ class MyRNN(nn.Module):
 class LSTMLaneFollower(nn.Module):
     def __init__(self):
         super().__init__()
-        self.convlstm = convLSTM.ConvLSTM(3, 1, (3,3), 6, True, True, False) 
+        self.convlstm = convLSTM.ConvLSTM(3, 32, (3,3), 6, True, True, False) 
         self.flat = nn.Flatten()
-        self.lin1 = nn.Linear(1*30*32, 512)
+        self.lin1 = nn.Linear(32*30*32, 128)
         self.relu = nn.ReLU()
-        self.lin2 = nn.Linear(512, 2)
+        self.lin2 = nn.Linear(128, 2)
 
     def forward(self, x):
         """
